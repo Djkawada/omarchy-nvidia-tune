@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve symlinks so SCRIPT_DIR points to actual repo bin/
+TARGET="$(realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$TARGET")" && pwd)"
+PY_CTL="${SCRIPT_DIR}/nvidia-tune-ctl.py"
+
+ACTION="${1:-status}"
+
+if [ "$ACTION" = "status" ]; then
+    python3 "$PY_CTL" "$@"
+else
+    if [ "$EUID" -eq 0 ]; then
+        python3 "$PY_CTL" "$@"
+    else
+        sudo "$PY_CTL" "$@"
+    fi
+fi

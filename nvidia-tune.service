@@ -1,0 +1,12 @@
+[Unit]
+Description=NVIDIA RTX GPU Tuning & Power Profile on Boot
+After=multi-user.target nvidia-persistenced.service graphical.target
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nvidia-tune-ctl apply-boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "com.github.djkawada.nvidia-tune",
+  "name": "NVIDIA GPU Control",
+  "version": "1.0.0",
+  "author": "Pierre (Djkawada)",
+  "license": "MIT",
+  "description": "Native NVML GPU hardware controller, undervolt, VRAM overclock, and profile manager for Omarchy Linux.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "NVIDIA GPU Control",
+    "description": "Hardware telemetry, live clock & voltage profiles, memory offset, and power management.",
+    "category": "Hardware",
+    "allowMultiple": false
+  }
+}
