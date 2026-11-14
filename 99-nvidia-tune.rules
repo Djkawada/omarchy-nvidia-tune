@@ -1,2 +1,2 @@
-# Allow wheel group (including pierre) to manage NVIDIA GPU tuning without password
-%wheel ALL=(ALL) NOPASSWD: /usr/local/bin/nvidia-tune-ctl, /home/pierre/Work/omarchy-nvidia-plugin/bin/nvidia-tune-ctl.py
+# Allow wheel group to run the root-installed NVIDIA GPU tuning backend without password
+%wheel ALL=(ALL) NOPASSWD: /usr/local/bin/nvidia-tune-ctl.py

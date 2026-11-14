@@ -9,12 +9,13 @@ sudo systemctl disable --now nvidia-tune.service 2>/dev/null || true
 sudo rm -f /etc/systemd/system/nvidia-tune.service
 sudo systemctl daemon-reload
 
-echo "==> Removing sudoers rule & binary link..."
+echo "==> Removing sudoers rule & binary links..."
 sudo rm -f /etc/sudoers.d/99-nvidia-tune
 sudo rm -f /usr/local/bin/nvidia-tune-ctl
+sudo rm -f /usr/local/bin/nvidia-tune-ctl.py
 
-echo "==> Removing plugin symlink..."
-rm -f "${USER_HOME}/.config/omarchy/plugins/${PLUGIN_ID}"
+echo "==> Removing plugin directory..."
+rm -rf "${USER_HOME}/.config/omarchy/plugins/${PLUGIN_ID}"
 
 echo "==> Removing from ~/.config/omarchy/shell.json..."
 SHELL_CONFIG="${USER_HOME}/.config/omarchy/shell.json"
@@ -34,7 +35,7 @@ with open('${SHELL_CONFIG}', 'w') as f:
 fi
 
 if command -v omarchy >/dev/null 2>&1; then
-    omarchy refresh shell 2>/dev/null || true
+    omarchy restart shell 2>/dev/null || true
 fi
 
 echo "=========================================================="

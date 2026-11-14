@@ -42,6 +42,13 @@ FloatingWindow {
   readonly property color textSecondary: Qt.rgba(Commons.Color.foreground.r, Commons.Color.foreground.g, Commons.Color.foreground.b, 0.78)
   readonly property color textDimmed: Qt.rgba(Commons.Color.foreground.r, Commons.Color.foreground.g, Commons.Color.foreground.b, 0.58)
 
+  function syncEditorControls() {
+    nameField.text = editName
+    coreSlider.value = editCoreMax > 0 ? editCoreMax : 1950
+    memSlider.value = editMemOffset
+    plSlider.value = editPowerLimit
+  }
+
   function loadProfileForEdit(p) {
     if (!p) return
     selectedProfileId = p.id || ""
@@ -51,16 +58,18 @@ FloatingWindow {
     editPowerLimit = p.power_limit !== undefined ? p.power_limit : 220
     editDesc = p.description || ""
     isEditingNew = false
+    syncEditorControls()
   }
 
   function startNewProfile() {
-    selectedProfileId = "custom-" + Math.floor(Math.random() * 1000)
+    selectedProfileId = "custom-" + Date.now().toString(36)
     editName = "My Custom Profile"
     editCoreMax = 1920
     editMemOffset = 600
     editPowerLimit = 220
     editDesc = "Custom tuned profile"
     isEditingNew = true
+    syncEditorControls()
   }
 
   FocusScope {
@@ -98,13 +107,13 @@ FloatingWindow {
           Column {
             anchors.verticalCenter: parent.verticalCenter
             Text {
-              text: rootWindow.pluginRoot ? rootWindow.pluginRoot.gpuName : "NVIDIA GeForce RTX 3070"
+              text: rootWindow.pluginRoot ? rootWindow.pluginRoot.gpuName : "NVIDIA GPU"
               font.pixelSize: 16
               font.bold: true
               color: Commons.Color.foreground
             }
             Text {
-              text: "Driver: " + (rootWindow.pluginRoot ? rootWindow.pluginRoot.driverVersion : "615.78") + " • NVML Hardware Controller"
+              text: "Driver: " + (rootWindow.pluginRoot && rootWindow.pluginRoot.driverVersion ? rootWindow.pluginRoot.driverVersion : "...") + " • NVML Hardware Controller"
               font.pixelSize: 11
               color: Commons.Color.muted
             }
@@ -191,10 +200,11 @@ FloatingWindow {
               anchors.horizontalCenter: parent.horizontalCenter
             }
             Text {
-              text: "Offset: +" + (rootWindow.pluginRoot ? rootWindow.pluginRoot.memOffset : 0) + " MHz"
+              readonly property int mOff: rootWindow.pluginRoot ? rootWindow.pluginRoot.memOffset : 0
+              text: "Offset: " + (mOff >= 0 ? "+" : "") + mOff + " MHz"
               font.pixelSize: 10
               font.bold: true
-              color: (rootWindow.pluginRoot && rootWindow.pluginRoot.memOffset > 0) ? Commons.Color.accent : rootWindow.textSecondary
+              color: mOff !== 0 ? Commons.Color.accent : rootWindow.textSecondary
               anchors.horizontalCenter: parent.horizontalCenter
             }
           }
@@ -445,10 +455,11 @@ FloatingWindow {
               spacing: 4
               Text { text: "Profile Display Name:"; font.pixelSize: 11; font.bold: true; color: rootWindow.textSecondary }
               TextField {
+                id: nameField
                 width: parent.width
                 height: Style.space(32)
                 text: rootWindow.editName
-                onTextChanged: rootWindow.editName = text
+                onTextEdited: rootWindow.editName = text
               }
             }
 
@@ -469,20 +480,21 @@ FloatingWindow {
                 }
               }
               Slider {
+                id: coreSlider
                 width: parent.width
                 from: 1600
                 to: 2100
                 stepSize: 10
-                value: rootWindow.editCoreMax > 0 ? rootWindow.editCoreMax : 1950
+                value: 1950
                 onMoved: rootWindow.editCoreMax = Math.round(value)
               }
               Row {
                 spacing: Style.space(6)
-                Button { text: "Stock (Uncapped)"; height: Style.space(24); onClicked: rootWindow.editCoreMax = 0 }
-                Button { text: "1800 MHz (Silent)"; height: Style.space(24); onClicked: rootWindow.editCoreMax = 1800 }
-                Button { text: "1920 MHz"; height: Style.space(24); onClicked: rootWindow.editCoreMax = 1920 }
-                Button { text: "1950 MHz (Sweetspot)"; height: Style.space(24); onClicked: rootWindow.editCoreMax = 1950 }
-                Button { text: "2050 MHz (OC)"; height: Style.space(24); onClicked: rootWindow.editCoreMax = 2050 }
+                Button { text: "Stock (Uncapped)"; height: Style.space(24); onClicked: { rootWindow.editCoreMax = 0; coreSlider.value = 1950 } }
+                Button { text: "1800 MHz (Silent)"; height: Style.space(24); onClicked: { rootWindow.editCoreMax = 1800; coreSlider.value = 1800 } }
+                Button { text: "1920 MHz"; height: Style.space(24); onClicked: { rootWindow.editCoreMax = 1920; coreSlider.value = 1920 } }
+                Button { text: "1950 MHz (Sweetspot)"; height: Style.space(24); onClicked: { rootWindow.editCoreMax = 1950; coreSlider.value = 1950 } }
+                Button { text: "2050 MHz (OC)"; height: Style.space(24); onClicked: { rootWindow.editCoreMax = 2050; coreSlider.value = 2050 } }
               }
             }
 
@@ -496,27 +508,28 @@ FloatingWindow {
                 Item { width: Math.max(4, parent.width - parent.children[0].implicitWidth - memValText.implicitWidth); height: 1 }
                 Text {
                   id: memValText
-                  text: "+" + rootWindow.editMemOffset + " MHz"
+                  text: (rootWindow.editMemOffset >= 0 ? "+" : "") + rootWindow.editMemOffset + " MHz"
                   font.pixelSize: 12
                   font.bold: true
                   color: Commons.Color.accent
                 }
               }
               Slider {
+                id: memSlider
                 width: parent.width
                 from: 0
                 to: 1200
                 stepSize: 50
-                value: rootWindow.editMemOffset
+                value: 800
                 onMoved: rootWindow.editMemOffset = Math.round(value)
               }
               Row {
                 spacing: Style.space(6)
-                Button { text: "+0 MHz (Stock)"; height: Style.space(24); onClicked: rootWindow.editMemOffset = 0 }
-                Button { text: "+400 MHz"; height: Style.space(24); onClicked: rootWindow.editMemOffset = 400 }
-                Button { text: "+600 MHz"; height: Style.space(24); onClicked: rootWindow.editMemOffset = 600 }
-                Button { text: "+800 MHz (Recommended)"; height: Style.space(24); onClicked: rootWindow.editMemOffset = 800 }
-                Button { text: "+1000 MHz"; height: Style.space(24); onClicked: rootWindow.editMemOffset = 1000 }
+                Button { text: "+0 MHz (Stock)"; height: Style.space(24); onClicked: { rootWindow.editMemOffset = 0; memSlider.value = 0 } }
+                Button { text: "+400 MHz"; height: Style.space(24); onClicked: { rootWindow.editMemOffset = 400; memSlider.value = 400 } }
+                Button { text: "+600 MHz"; height: Style.space(24); onClicked: { rootWindow.editMemOffset = 600; memSlider.value = 600 } }
+                Button { text: "+800 MHz (Recommended)"; height: Style.space(24); onClicked: { rootWindow.editMemOffset = 800; memSlider.value = 800 } }
+                Button { text: "+1000 MHz"; height: Style.space(24); onClicked: { rootWindow.editMemOffset = 1000; memSlider.value = 1000 } }
               }
             }
 
@@ -537,22 +550,32 @@ FloatingWindow {
                 }
               }
               Slider {
+                id: plSlider
                 width: parent.width
-                from: 100
-                to: 240
+                from: rootWindow.pluginRoot ? rootWindow.pluginRoot.minPowerLimit : 100
+                to: rootWindow.pluginRoot ? rootWindow.pluginRoot.maxPowerLimit : 240
                 stepSize: 5
-                value: rootWindow.editPowerLimit
+                value: 240
                 onMoved: rootWindow.editPowerLimit = Math.round(value)
               }
               Row {
                 spacing: Style.space(6)
-                Button { text: "180 W (Eco)"; height: Style.space(24); onClicked: rootWindow.editPowerLimit = 180 }
-                Button { text: "220 W (Stock)"; height: Style.space(24); onClicked: rootWindow.editPowerLimit = 220 }
-                Button { text: "240 W (Max Headroom)"; height: Style.space(24); onClicked: rootWindow.editPowerLimit = 240 }
+                Button { text: "180 W (Eco)"; height: Style.space(24); onClicked: { rootWindow.editPowerLimit = 180; plSlider.value = 180 } }
+                Button { text: "220 W (Stock)"; height: Style.space(24); onClicked: { rootWindow.editPowerLimit = 220; plSlider.value = 220 } }
+                Button { text: "240 W (Max Headroom)"; height: Style.space(24); onClicked: { rootWindow.editPowerLimit = 240; plSlider.value = 240 } }
               }
             }
 
             Item { height: Style.space(4); width: 1 }
+
+            Text {
+              visible: rootWindow.pluginRoot && rootWindow.pluginRoot.lastError !== ""
+              width: parent.width
+              text: rootWindow.pluginRoot ? rootWindow.pluginRoot.lastError : ""
+              font.pixelSize: 11
+              color: Commons.Color.urgent
+              wrapMode: Text.WordWrap
+            }
 
             // Action Buttons
             Row {
@@ -568,7 +591,8 @@ FloatingWindow {
                       rootWindow.editName,
                       rootWindow.editCoreMax,
                       rootWindow.editMemOffset,
-                      rootWindow.editPowerLimit
+                      rootWindow.editPowerLimit,
+                      rootWindow.editDesc
                     )
                   }
                 }
@@ -579,14 +603,14 @@ FloatingWindow {
                 height: Style.space(34)
                 onClicked: {
                   if (rootWindow.pluginRoot) {
-                    rootWindow.pluginRoot.saveProfile(
+                    rootWindow.pluginRoot.saveAndApplyProfile(
                       rootWindow.selectedProfileId,
                       rootWindow.editName,
                       rootWindow.editCoreMax,
                       rootWindow.editMemOffset,
-                      rootWindow.editPowerLimit
+                      rootWindow.editPowerLimit,
+                      rootWindow.editDesc
                     )
-                    rootWindow.pluginRoot.applyProfile(rootWindow.selectedProfileId)
                   }
                 }
               }

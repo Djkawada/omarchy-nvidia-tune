@@ -13,29 +13,30 @@ echo "=========================================================="
 chmod +x "${SCRIPT_DIR}/bin/nvidia-tune-ctl"
 chmod +x "${SCRIPT_DIR}/bin/nvidia-tune-ctl.py"
 
-# 2. Privileged system setup
+# 2. Privileged system setup (install root-owned copies, never symlinks to user-writable checkout)
 if [ "$EUID" -ne 0 ]; then
-    echo "==> Setting up system binaries, sudoers rule, and systemd service (requires sudo)..."
-    sudo ln -sfn "${SCRIPT_DIR}/bin/nvidia-tune-ctl" /usr/local/bin/nvidia-tune-ctl
-    sudo ln -sfn "${SCRIPT_DIR}/bin/nvidia-tune-ctl.py" /usr/local/bin/nvidia-tune-ctl.py
-    sudo install -Dm440 "${SCRIPT_DIR}/99-nvidia-tune.rules" /etc/sudoers.d/99-nvidia-tune
-    sudo install -Dm644 "${SCRIPT_DIR}/nvidia-tune.service" /etc/systemd/system/nvidia-tune.service
+    echo "==> Installing root-owned system binaries, sudoers rule, and systemd service (requires sudo)..."
+    sudo install -Dm755 -o root -g root "${SCRIPT_DIR}/bin/nvidia-tune-ctl" /usr/local/bin/nvidia-tune-ctl
+    sudo install -Dm755 -o root -g root "${SCRIPT_DIR}/bin/nvidia-tune-ctl.py" /usr/local/bin/nvidia-tune-ctl.py
+    sudo install -Dm440 -o root -g root "${SCRIPT_DIR}/99-nvidia-tune.rules" /etc/sudoers.d/99-nvidia-tune
+    sudo install -Dm644 -o root -g root "${SCRIPT_DIR}/nvidia-tune.service" /etc/systemd/system/nvidia-tune.service
     sudo systemctl daemon-reload
     sudo systemctl enable --now nvidia-tune.service
 else
-    ln -sfn "${SCRIPT_DIR}/bin/nvidia-tune-ctl" /usr/local/bin/nvidia-tune-ctl
-    ln -sfn "${SCRIPT_DIR}/bin/nvidia-tune-ctl.py" /usr/local/bin/nvidia-tune-ctl.py
-    install -Dm440 "${SCRIPT_DIR}/99-nvidia-tune.rules" /etc/sudoers.d/99-nvidia-tune
-    install -Dm644 "${SCRIPT_DIR}/nvidia-tune.service" /etc/systemd/system/nvidia-tune.service
+    install -Dm755 -o root -g root "${SCRIPT_DIR}/bin/nvidia-tune-ctl" /usr/local/bin/nvidia-tune-ctl
+    install -Dm755 -o root -g root "${SCRIPT_DIR}/bin/nvidia-tune-ctl.py" /usr/local/bin/nvidia-tune-ctl.py
+    install -Dm440 -o root -g root "${SCRIPT_DIR}/99-nvidia-tune.rules" /etc/sudoers.d/99-nvidia-tune
+    install -Dm644 -o root -g root "${SCRIPT_DIR}/nvidia-tune.service" /etc/systemd/system/nvidia-tune.service
     systemctl daemon-reload
     systemctl enable --now nvidia-tune.service
 fi
 
-# 3. User plugin directory copy
+# 3. User plugin directory copy (excluding .git)
 PLUGINS_DIR="${USER_HOME}/.config/omarchy/plugins"
-mkdir -p "${PLUGINS_DIR}"
-rm -rf "${PLUGINS_DIR}/${PLUGIN_ID}"
-cp -r "${SCRIPT_DIR}" "${PLUGINS_DIR}/${PLUGIN_ID}"
+mkdir -p "${PLUGINS_DIR}/${PLUGIN_ID}"
+rm -rf "${PLUGINS_DIR}/${PLUGIN_ID}"/* "${PLUGINS_DIR}/${PLUGIN_ID}"/.[!.]*
+cp -r "${SCRIPT_DIR}"/* "${PLUGINS_DIR}/${PLUGIN_ID}/"
+[ -f "${SCRIPT_DIR}/.gitignore" ] && cp "${SCRIPT_DIR}/.gitignore" "${PLUGINS_DIR}/${PLUGIN_ID}/.gitignore" || true
 echo "==> Installed plugin to ${PLUGINS_DIR}/${PLUGIN_ID}"
 
 # 4. Register in ~/.config/omarchy/shell.json
@@ -65,10 +66,10 @@ else:
 "
 fi
 
-# 5. Reload Omarchy shell
+# 5. Restart Omarchy shell
 if command -v omarchy >/dev/null 2>&1; then
-    omarchy refresh shell 2>/dev/null || omarchy restart shell 2>/dev/null || true
-    echo "==> Refreshed Omarchy shell."
+    omarchy restart shell 2>/dev/null || true
+    echo "==> Restarted Omarchy shell."
 fi
 
 echo ""

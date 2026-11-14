@@ -1,19 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Resolve symlinks so SCRIPT_DIR points to actual repo bin/
+# Resolve script directory for unprivileged local queries
 TARGET="$(realpath "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$TARGET")" && pwd)"
 PY_CTL="${SCRIPT_DIR}/nvidia-tune-ctl.py"
+SYS_PY_CTL="/usr/local/bin/nvidia-tune-ctl.py"
 
 ACTION="${1:-status}"
 
-if [ "$ACTION" = "status" ]; then
-    python3 "$PY_CTL" "$@"
-else
-    if [ "$EUID" -eq 0 ]; then
-        python3 "$PY_CTL" "$@"
-    else
-        sudo "$PY_CTL" "$@"
-    fi
-fi
+case "$ACTION" in
+    status|watch|save-profile|delete-profile)
+        exec python3 "$PY_CTL" "$@"
+        ;;
+    apply|apply-boot|toggle)
+        if [ ! -f "$SYS_PY_CTL" ]; then
+            echo '{"success":false,"error":"Root-owned /usr/local/bin/nvidia-tune-ctl.py is not installed. Run setup.sh."}' >&2
+            exit 1
+        fi
+        if [ "$EUID" -eq 0 ]; then
+            exec python3 "$SYS_PY_CTL" "$@"
+        else
+            exec sudo "$SYS_PY_CTL" "$@"
+        fi
+        ;;
+    *)
+        echo '{"success":false,"error":"Unknown action"}' >&2
+        exit 1
+        ;;
+esac

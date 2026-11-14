@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 NVIDIA RTX Tuning Backend (NVML-powered) for Omarchy Linux
-Provides hardware control, live metrics, profile management, and system persistence.
+Provides hardware control, live metrics, streaming watch mode, profile management, and system persistence.
 """
 
 from __future__ import annotations
@@ -10,7 +10,9 @@ import argparse
 import ctypes
 import json
 import os
+import select
 import sys
+import time
 from pathlib import Path
 
 # --- NVML Structures & Constants ---
@@ -45,6 +47,8 @@ class NVMLClient:
         except OSError as e:
             raise RuntimeError(f"Failed to load libnvidia-ml.so.1: {e}")
 
+        self._configure_signatures()
+
         ret = self.nvml.nvmlInit_v2()
         if ret != NVML_SUCCESS:
             raise RuntimeError(f"nvmlInit_v2 failed with error code {ret}")
@@ -52,7 +56,49 @@ class NVMLClient:
         self.handle = ctypes.c_void_p()
         ret = self.nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(self.handle))
         if ret != NVML_SUCCESS:
+            self.nvml.nvmlShutdown()
             raise RuntimeError(f"Failed to get handle for GPU 0: error {ret}")
+
+    def _configure_signatures(self):
+        c_int = ctypes.c_int
+        c_uint = ctypes.c_uint
+        c_void_p = ctypes.c_void_p
+        c_char_p = ctypes.c_char_p
+
+        sigs = [
+            ("nvmlInit_v2", [], c_int),
+            ("nvmlShutdown", [], c_int),
+            ("nvmlDeviceGetHandleByIndex_v2", [c_uint, ctypes.POINTER(c_void_p)], c_int),
+            ("nvmlDeviceGetName", [c_void_p, c_char_p, c_uint], c_int),
+            ("nvmlSystemGetDriverVersion", [c_char_p, c_uint], c_int),
+            ("nvmlDeviceGetTemperature", [c_void_p, c_int, ctypes.POINTER(c_uint)], c_int),
+            ("nvmlDeviceGetPowerUsage", [c_void_p, ctypes.POINTER(c_uint)], c_int),
+            ("nvmlDeviceGetEnforcedPowerLimit", [c_void_p, ctypes.POINTER(c_uint)], c_int),
+            (
+                "nvmlDeviceGetPowerManagementLimitConstraints",
+                [c_void_p, ctypes.POINTER(c_uint), ctypes.POINTER(c_uint)],
+                c_int,
+            ),
+            ("nvmlDeviceGetClockInfo", [c_void_p, c_int, ctypes.POINTER(c_uint)], c_int),
+            ("nvmlDeviceGetFanSpeed", [c_void_p, ctypes.POINTER(c_uint)], c_int),
+            ("nvmlDeviceGetUtilizationRates", [c_void_p, ctypes.POINTER(NvmlUtilization)], c_int),
+            ("nvmlDeviceGetMemoryInfo", [c_void_p, ctypes.POINTER(NvmlMemory)], c_int),
+            ("nvmlDeviceSetPowerManagementLimit", [c_void_p, c_uint], c_int),
+            ("nvmlDeviceSetGpuLockedClocks", [c_void_p, c_uint, c_uint], c_int),
+            ("nvmlDeviceResetGpuLockedClocks", [c_void_p], c_int),
+        ]
+        for name, argtypes, restype in sigs:
+            fn = getattr(self.nvml, name, None)
+            if fn is not None:
+                fn.argtypes = argtypes
+                fn.restype = restype
+
+        if hasattr(self.nvml, "nvmlDeviceGetMemClkVfOffset"):
+            self.nvml.nvmlDeviceGetMemClkVfOffset.argtypes = [c_void_p, ctypes.POINTER(c_int)]
+            self.nvml.nvmlDeviceGetMemClkVfOffset.restype = c_int
+        if hasattr(self.nvml, "nvmlDeviceSetMemClkVfOffset"):
+            self.nvml.nvmlDeviceSetMemClkVfOffset.argtypes = [c_void_p, c_int]
+            self.nvml.nvmlDeviceSetMemClkVfOffset.restype = c_int
 
     def __enter__(self):
         return self
@@ -66,13 +112,13 @@ class NVMLClient:
     def get_name(self) -> str:
         buf = ctypes.create_string_buffer(96)
         if self.nvml.nvmlDeviceGetName(self.handle, buf, 96) == NVML_SUCCESS:
-            return buf.value.decode("utf-8")
+            return buf.value.decode("utf-8", errors="replace")
         return "NVIDIA GPU"
 
     def get_driver_version(self) -> str:
         buf = ctypes.create_string_buffer(80)
         if self.nvml.nvmlSystemGetDriverVersion(buf, 80) == NVML_SUCCESS:
-            return buf.value.decode("utf-8")
+            return buf.value.decode("utf-8", errors="replace")
         return "Unknown"
 
     def get_temperature(self) -> int:
@@ -96,7 +142,12 @@ class NVMLClient:
     def get_power_constraints_w(self) -> tuple[int, int]:
         min_p = ctypes.c_uint()
         max_p = ctypes.c_uint()
-        if self.nvml.nvmlDeviceGetPowerManagementLimitConstraints(self.handle, ctypes.byref(min_p), ctypes.byref(max_p)) == NVML_SUCCESS:
+        if (
+            self.nvml.nvmlDeviceGetPowerManagementLimitConstraints(
+                self.handle, ctypes.byref(min_p), ctypes.byref(max_p)
+            )
+            == NVML_SUCCESS
+        ):
             return int(min_p.value // 1000), int(max_p.value // 1000)
         return 100, 240
 
@@ -140,31 +191,31 @@ class NVMLClient:
             return used_mb, total_mb, free_mb
         return 0, 8192, 0
 
-    def set_power_limit_w(self, watts: int) -> bool:
-        watts = max(100, min(240, watts))
-        milliwatts = ctypes.c_uint(watts * 1000)
+    def set_power_limit_w(self, watts: int) -> tuple[bool, int]:
+        min_pl, max_pl = self.get_power_constraints_w()
+        clamped = max(min_pl, min(max_pl, watts))
+        milliwatts = ctypes.c_uint(clamped * 1000)
         ret = self.nvml.nvmlDeviceSetPowerManagementLimit(self.handle, milliwatts)
-        return ret == NVML_SUCCESS
+        return ret == NVML_SUCCESS, ret
 
-    def set_gpu_locked_clocks(self, min_mhz: int, max_mhz: int) -> bool:
+    def set_gpu_locked_clocks(self, min_mhz: int, max_mhz: int) -> tuple[bool, int]:
         if max_mhz <= 0:
-            ret = self.nvml.nvmlDeviceResetGpuLockedClocks(self.handle)
-            return ret == NVML_SUCCESS
+            return self.reset_gpu_locked_clocks()
         min_c = ctypes.c_uint(min_mhz)
         max_c = ctypes.c_uint(max_mhz)
         ret = self.nvml.nvmlDeviceSetGpuLockedClocks(self.handle, min_c, max_c)
-        return ret == NVML_SUCCESS
+        return ret == NVML_SUCCESS, ret
 
-    def reset_gpu_locked_clocks(self) -> bool:
+    def reset_gpu_locked_clocks(self) -> tuple[bool, int]:
         ret = self.nvml.nvmlDeviceResetGpuLockedClocks(self.handle)
-        return ret == NVML_SUCCESS
+        return ret == NVML_SUCCESS, ret
 
-    def set_mem_offset_mhz(self, offset_mhz: int) -> bool:
+    def set_mem_offset_mhz(self, offset_mhz: int) -> tuple[bool, int]:
         if hasattr(self.nvml, "nvmlDeviceSetMemClkVfOffset"):
             val = ctypes.c_int(offset_mhz)
             ret = self.nvml.nvmlDeviceSetMemClkVfOffset(self.handle, val)
-            return ret == NVML_SUCCESS
-        return False
+            return ret == NVML_SUCCESS, ret
+        return (offset_mhz == 0), -1
 
 
 # --- Configuration & Profile Manager ---
@@ -212,19 +263,31 @@ DEFAULT_PROFILES = {
 }
 
 
+def _chown_to_sudo_user(path: Path):
+    """Ensure files created under sudo in a user's home directory remain owned by that user."""
+    if os.geteuid() != 0:
+        return
+    sudo_uid = os.environ.get("SUDO_UID")
+    sudo_gid = os.environ.get("SUDO_GID")
+    if sudo_uid and sudo_gid:
+        try:
+            os.chown(path, int(sudo_uid), int(sudo_gid))
+        except OSError:
+            pass
+
+
 def get_config_dir() -> Path:
-    # Prefer user config directory
-    home = os.environ.get("HOME", "")
-    if home and home != "/root":
-        p = Path(home) / ".config" / "nvidia-tune"
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        p = Path(f"/home/{sudo_user}/.config/nvidia-tune")
     else:
-        # Check if SUDO_USER is set
-        sudo_user = os.environ.get("SUDO_USER")
-        if sudo_user and sudo_user != "root":
-            p = Path(f"/home/{sudo_user}/.config/nvidia-tune")
+        home = os.environ.get("HOME", "")
+        if home and home != "/root":
+            p = Path(home) / ".config" / "nvidia-tune"
         else:
             p = Path("/etc/nvidia-tune")
     p.mkdir(parents=True, exist_ok=True)
+    _chown_to_sudo_user(p)
     return p
 
 
@@ -236,21 +299,25 @@ def get_state_file() -> Path:
     return get_config_dir() / "active.json"
 
 
+def get_system_profiles_file() -> Path:
+    return Path("/etc/nvidia-tune/profiles.json")
+
+
 def get_system_state_file() -> Path:
     return Path("/etc/nvidia-tune/active.json")
 
 
 def load_profiles() -> dict[str, dict]:
-    f = get_profiles_file()
-    profiles = dict(DEFAULT_PROFILES)
-    if f.exists():
-        try:
-            with f.open("r", encoding="utf-8") as stream:
-                data = json.load(stream)
-                if isinstance(data, dict):
-                    profiles.update(data)
-        except Exception:
-            pass
+    profiles = {k: dict(v) for k, v in DEFAULT_PROFILES.items()}
+    for candidate in (get_system_profiles_file(), get_profiles_file()):
+        if candidate.exists():
+            try:
+                with candidate.open("r", encoding="utf-8") as stream:
+                    data = json.load(stream)
+                    if isinstance(data, dict):
+                        profiles.update(data)
+            except Exception:
+                pass
     return profiles
 
 
@@ -258,25 +325,41 @@ def save_profiles(profiles: dict[str, dict]):
     f = get_profiles_file()
     with f.open("w", encoding="utf-8") as stream:
         json.dump(profiles, stream, indent=2)
+    _chown_to_sudo_user(f)
+
+    # Mirror to /etc/nvidia-tune if writable (e.g. when running as root) so boot service sees custom profiles
+    if os.geteuid() == 0:
+        try:
+            sys_f = get_system_profiles_file()
+            sys_f.parent.mkdir(parents=True, exist_ok=True)
+            with sys_f.open("w", encoding="utf-8") as stream:
+                json.dump(profiles, stream, indent=2)
+        except Exception:
+            pass
+
+
+def _sync_system_profiles(profiles: dict[str, dict]):
+    if os.geteuid() != 0:
+        return
+    try:
+        sys_f = get_system_profiles_file()
+        sys_f.parent.mkdir(parents=True, exist_ok=True)
+        with sys_f.open("w", encoding="utf-8") as stream:
+            json.dump(profiles, stream, indent=2)
+    except Exception:
+        pass
 
 
 def get_active_profile_id() -> str:
-    sf = get_state_file()
-    if sf.exists():
-        try:
-            with sf.open("r", encoding="utf-8") as stream:
-                data = json.load(stream)
-                return data.get("active_profile", "stock")
-        except Exception:
-            pass
-    sys_f = get_system_state_file()
-    if sys_f.exists():
-        try:
-            with sys_f.open("r", encoding="utf-8") as stream:
-                data = json.load(stream)
-                return data.get("active_profile", "stock")
-        except Exception:
-            pass
+    for sf in (get_state_file(), get_system_state_file()):
+        if sf.exists():
+            try:
+                with sf.open("r", encoding="utf-8") as stream:
+                    data = json.load(stream)
+                    if isinstance(data, dict) and "active_profile" in data:
+                        return data["active_profile"]
+            except Exception:
+                pass
     return "stock"
 
 
@@ -285,13 +368,13 @@ def set_active_profile_id(profile_id: str):
     try:
         with sf.open("w", encoding="utf-8") as stream:
             json.dump({"active_profile": profile_id}, stream, indent=2)
+        _chown_to_sudo_user(sf)
     except Exception:
         pass
 
     try:
-        sys_dir = Path("/etc/nvidia-tune")
-        sys_dir.mkdir(parents=True, exist_ok=True)
         sys_f = get_system_state_file()
+        sys_f.parent.mkdir(parents=True, exist_ok=True)
         with sys_f.open("w", encoding="utf-8") as stream:
             json.dump({"active_profile": profile_id}, stream, indent=2)
     except Exception:
@@ -311,14 +394,29 @@ def apply_profile(profile_id: str) -> dict:
 
     try:
         with NVMLClient() as client:
-            client.set_power_limit_w(power_limit)
+            errors = []
+            ok_pl, err_pl = client.set_power_limit_w(power_limit)
+            if not ok_pl:
+                errors.append(f"set_power_limit_w({power_limit}W) failed (NVML error {err_pl})")
+
             if core_max > 0:
-                client.set_gpu_locked_clocks(core_min, core_max)
+                ok_clk, err_clk = client.set_gpu_locked_clocks(core_min, core_max)
+                if not ok_clk:
+                    errors.append(f"set_gpu_locked_clocks({core_min}, {core_max}) failed (NVML error {err_clk})")
             else:
-                client.reset_gpu_locked_clocks()
-            client.set_mem_offset_mhz(mem_offset)
+                ok_clk, err_clk = client.reset_gpu_locked_clocks()
+                if not ok_clk:
+                    errors.append(f"reset_gpu_locked_clocks() failed (NVML error {err_clk})")
+
+            ok_mem, err_mem = client.set_mem_offset_mhz(mem_offset)
+            if not ok_mem:
+                errors.append(f"set_mem_offset_mhz({mem_offset}) failed (NVML error {err_mem})")
+
+            if errors:
+                return {"success": False, "error": "; ".join(errors)}
 
         set_active_profile_id(profile_id)
+        _sync_system_profiles(profiles)
         return {
             "success": True,
             "active_profile": profile_id,
@@ -328,53 +426,132 @@ def apply_profile(profile_id: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def _build_status_payload(
+    client: NVMLClient,
+    static_gpu: dict,
+    static_limits: tuple[int, int, int],
+    profiles: dict[str, dict],
+    active_id: str,
+) -> dict:
+    used_mb, _, free_mb = client.get_vram()
+    gpu_util, mem_util = client.get_utilization()
+    min_pl, max_pl, total_mb = static_limits
+    active_profile = profiles.get(active_id, DEFAULT_PROFILES["stock"])
+
+    return {
+        "success": True,
+        "gpu": static_gpu,
+        "metrics": {
+            "temperature": client.get_temperature(),
+            "power_w": client.get_power_usage_w(),
+            "power_limit_w": client.get_power_limit_w(),
+            "min_power_limit_w": min_pl,
+            "max_power_limit_w": max_pl,
+            "core_clock_mhz": client.get_core_clock_mhz(),
+            "mem_clock_mhz": client.get_memory_clock_mhz(),
+            "mem_offset_mhz": client.get_mem_offset_mhz(),
+            "fan_speed_pct": client.get_fan_speed_pct(),
+            "gpu_utilization_pct": gpu_util,
+            "mem_utilization_pct": mem_util,
+            "vram_used_mb": used_mb,
+            "vram_total_mb": total_mb,
+            "vram_free_mb": free_mb,
+        },
+        "active_profile_id": active_id,
+        "active_profile": active_profile,
+        "is_tuned": active_id != "stock",
+        "profiles": list(profiles.values()),
+    }
+
+
 def get_status() -> dict:
     profiles = load_profiles()
     active_id = get_active_profile_id()
-    active_profile = profiles.get(active_id, DEFAULT_PROFILES["stock"])
 
     try:
         with NVMLClient() as client:
-            used_mb, total_mb, free_mb = client.get_vram()
-            gpu_util, mem_util = client.get_utilization()
-            min_pl, max_pl = client.get_power_constraints_w()
-
-            status = {
-                "success": True,
-                "gpu": {
-                    "name": client.get_name(),
-                    "driver_version": client.get_driver_version(),
-                },
-                "metrics": {
-                    "temperature": client.get_temperature(),
-                    "power_w": client.get_power_usage_w(),
-                    "power_limit_w": client.get_power_limit_w(),
-                    "min_power_limit_w": min_pl,
-                    "max_power_limit_w": max_pl,
-                    "core_clock_mhz": client.get_core_clock_mhz(),
-                    "mem_clock_mhz": client.get_memory_clock_mhz(),
-                    "mem_offset_mhz": client.get_mem_offset_mhz(),
-                    "fan_speed_pct": client.get_fan_speed_pct(),
-                    "gpu_utilization_pct": gpu_util,
-                    "mem_utilization_pct": mem_util,
-                    "vram_used_mb": used_mb,
-                    "vram_total_mb": total_mb,
-                    "vram_free_mb": free_mb,
-                },
-                "active_profile_id": active_id,
-                "active_profile": active_profile,
-                "is_tuned": active_id != "stock",
-                "profiles": list(profiles.values()),
+            static_gpu = {
+                "name": client.get_name(),
+                "driver_version": client.get_driver_version(),
             }
-            return status
+            min_pl, max_pl = client.get_power_constraints_w()
+            _, total_mb, _ = client.get_vram()
+            return _build_status_payload(
+                client, static_gpu, (min_pl, max_pl, total_mb), profiles, active_id
+            )
     except Exception as e:
         return {
             "success": False,
             "error": str(e),
             "active_profile_id": active_id,
-            "active_profile": active_profile,
+            "active_profile": profiles.get(active_id, DEFAULT_PROFILES["stock"]),
             "profiles": list(profiles.values()),
         }
+
+
+def _file_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return -1.0
+
+
+def watch_status(fast_interval: float = 0.8, slow_interval: float = 3.5):
+    """Keep one NVML session open and stream single-line JSON updates to stdout."""
+    profiles_file = get_profiles_file()
+    state_file = get_state_file()
+    sys_state_file = get_system_state_file()
+
+    last_mtimes = (-2.0, -2.0, -2.0)
+    profiles = DEFAULT_PROFILES
+    active_id = "stock"
+    interval = slow_interval
+
+    with NVMLClient() as client:
+        static_gpu = {
+            "name": client.get_name(),
+            "driver_version": client.get_driver_version(),
+        }
+        min_pl, max_pl = client.get_power_constraints_w()
+        _, total_mb, _ = client.get_vram()
+        static_limits = (min_pl, max_pl, total_mb)
+
+        while True:
+            cur_mtimes = (
+                _file_mtime(profiles_file),
+                _file_mtime(state_file),
+                _file_mtime(sys_state_file),
+            )
+            if cur_mtimes != last_mtimes:
+                profiles = load_profiles()
+                active_id = get_active_profile_id()
+                last_mtimes = cur_mtimes
+
+            payload = _build_status_payload(client, static_gpu, static_limits, profiles, active_id)
+            sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+
+            # Wait up to `interval` seconds, waking early on stdin commands ("fast", "slow", "refresh")
+            deadline = time.monotonic() + interval
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                readable, _, _ = select.select([sys.stdin], [], [], remaining)
+                if not readable:
+                    break
+                line = sys.stdin.readline()
+                if not line:
+                    return
+                cmd = line.strip().lower()
+                if cmd == "fast":
+                    interval = fast_interval
+                    break
+                if cmd == "slow":
+                    interval = slow_interval
+                    break
+                if cmd == "refresh":
+                    break
 
 
 def main():
@@ -383,6 +560,11 @@ def main():
 
     # status
     subparsers.add_parser("status", help="Get live GPU metrics and active profile JSON")
+
+    # watch
+    watch_parser = subparsers.add_parser("watch", help="Stream live GPU metrics as JSON lines")
+    watch_parser.add_argument("--fast", type=float, default=0.8, help="Fast polling interval in seconds")
+    watch_parser.add_argument("--slow", type=float, default=3.5, help="Slow polling interval in seconds")
 
     # apply
     apply_parser = subparsers.add_parser("apply", help="Apply a profile by ID")
@@ -400,7 +582,7 @@ def main():
     save_parser.add_argument("name", help="Display name")
     save_parser.add_argument("core_max", type=int, help="Core max clock in MHz (0 for uncapped)")
     save_parser.add_argument("mem_offset", type=int, help="VRAM offset in MHz (0-1200)")
-    save_parser.add_argument("power_limit", type=int, help="Power limit in Watts (100-240)")
+    save_parser.add_argument("power_limit", type=int, help="Power limit in Watts")
     save_parser.add_argument("--core-min", type=int, default=210, help="Core min clock (default: 210)")
     save_parser.add_argument("--desc", default="", help="Profile description")
 
@@ -412,6 +594,11 @@ def main():
 
     if args.command == "status":
         print(json.dumps(get_status(), indent=2))
+    elif args.command == "watch":
+        try:
+            watch_status(fast_interval=args.fast, slow_interval=args.slow)
+        except KeyboardInterrupt:
+            pass
     elif args.command == "apply":
         res = apply_profile(args.profile_id)
         print(json.dumps(res, indent=2))
@@ -435,12 +622,13 @@ def main():
         profiles[args.id] = {
             "id": args.id,
             "name": args.name,
-            "description": args.desc or f"Core: {args.core_max} MHz, Mem: +{args.mem_offset} MHz, Power: {args.power_limit} W",
+            "description": args.desc
+            or f"Core: {args.core_max} MHz, Mem: +{args.mem_offset} MHz, Power: {args.power_limit} W",
             "core_min": args.core_min,
             "core_max": args.core_max,
             "mem_offset": args.mem_offset,
             "power_limit": args.power_limit,
-            "is_system": False,
+            "is_system": args.id in DEFAULT_PROFILES,
         }
         save_profiles(profiles)
         print(json.dumps({"success": True, "saved_profile": profiles[args.id]}, indent=2))

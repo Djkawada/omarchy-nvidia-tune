@@ -14,13 +14,16 @@ BarWidget {
   implicitHeight: button.implicitHeight
 
   readonly property string ctlPath: Qt.resolvedUrl("bin/nvidia-tune-ctl").toString().replace(/^file:\/\//, "")
+  readonly property string pyCtlPath: Qt.resolvedUrl("bin/nvidia-tune-ctl.py").toString().replace(/^file:\/\//, "")
 
   // Live GPU Properties
-  property string gpuName: "NVIDIA GeForce RTX 3070"
-  property string driverVersion: "615.78"
+  property string gpuName: "NVIDIA GPU"
+  property string driverVersion: ""
   property int gpuTemp: 0
   property real powerWatts: 0.0
   property int powerLimit: 220
+  property int minPowerLimit: 100
+  property int maxPowerLimit: 240
   property int coreClock: 0
   property int memClock: 0
   property int memOffset: 0
@@ -35,9 +38,18 @@ BarWidget {
   property var activeProfile: null
   property bool isTuned: false
   property var profiles: []
+  property string lastError: ""
+  property string pendingApplyId: ""
 
   property bool panelOpen: false
   property bool controlCenterOpen: false
+  readonly property bool fastPolling: panelOpen || controlCenterOpen
+
+  onFastPollingChanged: {
+    if (watchProc.running) {
+      watchProc.write(fastPolling ? "fast\n" : "slow\n")
+    }
+  }
 
   // High-contrast secondary text colors for excellent legibility (avoids dim/dark muted grey)
   readonly property color textSecondary: Qt.rgba(Commons.Color.foreground.r, Commons.Color.foreground.g, Commons.Color.foreground.b, 0.78)
@@ -48,35 +60,101 @@ BarWidget {
     root.panelOpen = false
   }
 
+  function applyStatusData(data) {
+    if (!data) return
+    if (data.success) {
+      if (data.gpu) {
+        root.gpuName = data.gpu.name || "NVIDIA GPU"
+        root.driverVersion = data.gpu.driver_version || ""
+      }
+      if (data.metrics) {
+        root.gpuTemp = data.metrics.temperature || 0
+        root.powerWatts = data.metrics.power_w || 0.0
+        root.powerLimit = data.metrics.power_limit_w || 220
+        root.minPowerLimit = data.metrics.min_power_limit_w || 100
+        root.maxPowerLimit = data.metrics.max_power_limit_w || 240
+        root.coreClock = data.metrics.core_clock_mhz || 0
+        root.memClock = data.metrics.mem_clock_mhz || 0
+        root.memOffset = data.metrics.mem_offset_mhz || 0
+        root.fanSpeed = data.metrics.fan_speed_pct || 0
+        root.gpuUtil = data.metrics.gpu_utilization_pct || 0
+        root.memUtil = data.metrics.mem_utilization_pct || 0
+        root.vramUsed = data.metrics.vram_used_mb || 0
+        root.vramTotal = data.metrics.vram_total_mb || 8192
+      }
+      root.activeProfileId = data.active_profile_id || "stock"
+      root.activeProfile = data.active_profile || null
+      root.isTuned = Boolean(data.is_tuned)
+      root.profiles = data.profiles || []
+    } else if (data.error) {
+      root.lastError = data.error
+    }
+  }
+
+  function handleActionOutput(text, fallbackMsg) {
+    try {
+      var res = JSON.parse(text || "{}")
+      if (res.success === false) {
+        root.lastError = res.error || fallbackMsg
+        return false
+      }
+      root.lastError = ""
+      return true
+    } catch (e) {
+      return true
+    }
+  }
+
   function refresh() {
-    if (!statusProc.running) statusProc.running = true
+    if (watchProc.running) {
+      watchProc.write("refresh\n")
+    } else {
+      watchProc.running = true
+    }
   }
 
   function applyProfile(id) {
+    if (applyProc.running) return
+    root.lastError = ""
     applyProc.command = [root.ctlPath, "apply", id]
     applyProc.running = true
   }
 
   function toggleProfile() {
+    if (toggleProc.running) return
+    root.lastError = ""
     toggleProc.command = [root.ctlPath, "toggle"]
     toggleProc.running = true
   }
 
-  function saveProfile(id, name, coreMax, memOffset, powerLimit) {
+  function saveProfile(id, name, coreMax, memOffset, powerLimit, desc) {
+    if (saveProc.running) return
+    root.lastError = ""
     saveProc.command = [
-      root.ctlPath,
+      "python3",
+      root.pyCtlPath,
       "save-profile",
       id,
       name,
       String(coreMax),
       String(memOffset),
-      String(powerLimit)
+      String(powerLimit),
+      "--desc",
+      desc || ""
     ]
     saveProc.running = true
   }
 
+  function saveAndApplyProfile(id, name, coreMax, memOffset, powerLimit, desc) {
+    if (saveProc.running || applyProc.running) return
+    root.pendingApplyId = id
+    saveProfile(id, name, coreMax, memOffset, powerLimit, desc)
+  }
+
   function deleteProfile(id) {
-    delProc.command = [root.ctlPath, "delete-profile", id]
+    if (delProc.running) return
+    root.lastError = ""
+    delProc.command = ["python3", root.pyCtlPath, "delete-profile", id]
     delProc.running = true
   }
 
@@ -101,49 +179,39 @@ BarWidget {
     }
   }
 
-  Component.onCompleted: refresh()
-
-  // Polling Timer: 800ms when open, 3500ms in background
   Timer {
-    interval: (root.panelOpen || root.controlCenterOpen) ? 800 : 3500
-    running: true
-    repeat: true
-    onTriggered: root.refresh()
+    id: watchRestartTimer
+    interval: 3000
+    repeat: false
+    onTriggered: {
+      if (!watchProc.running) watchProc.running = true
+    }
   }
 
   // --- Process Handlers ---
   Process {
-    id: statusProc
-    command: [root.ctlPath, "status"]
-    stdout: StdioCollector {
+    id: watchProc
+    command: ["python3", root.pyCtlPath, "watch", "--fast", "0.8", "--slow", "3.5"]
+    running: true
+    stdinEnabled: true
+    stdout: SplitParser {
+      onRead: function(line) {
+        try {
+          root.applyStatusData(JSON.parse(line))
+        } catch (e) {}
+      }
+    }
+    stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        try {
-          var data = JSON.parse(text || "{}")
-          if (data.success) {
-            if (data.gpu) {
-              root.gpuName = data.gpu.name || "NVIDIA GPU"
-              root.driverVersion = data.gpu.driver_version || ""
-            }
-            if (data.metrics) {
-              root.gpuTemp = data.metrics.temperature || 0
-              root.powerWatts = data.metrics.power_w || 0.0
-              root.powerLimit = data.metrics.power_limit_w || 220
-              root.coreClock = data.metrics.core_clock_mhz || 0
-              root.memClock = data.metrics.mem_clock_mhz || 0
-              root.memOffset = data.metrics.mem_offset_mhz || 0
-              root.fanSpeed = data.metrics.fan_speed_pct || 0
-              root.gpuUtil = data.metrics.gpu_utilization_pct || 0
-              root.memUtil = data.metrics.mem_utilization_pct || 0
-              root.vramUsed = data.metrics.vram_used_mb || 0
-              root.vramTotal = data.metrics.vram_total_mb || 8192
-            }
-            root.activeProfileId = data.active_profile_id || "stock"
-            root.activeProfile = data.active_profile || null
-            root.isTuned = Boolean(data.is_tuned)
-            root.profiles = data.profiles || []
-          }
-        } catch (e) {}
+        if (text && text.trim().length > 0) {
+          root.lastError = text.trim()
+        }
+      }
+    }
+    onExited: function(code, status) {
+      if (code !== 0) {
+        watchRestartTimer.start()
       }
     }
   }
@@ -152,7 +220,16 @@ BarWidget {
     id: applyProc
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.refresh()
+      onStreamFinished: {
+        root.handleActionOutput(text, "Failed to apply profile")
+        root.refresh()
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim().length > 0) root.lastError = text.trim()
+      }
     }
   }
 
@@ -160,7 +237,16 @@ BarWidget {
     id: toggleProc
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.refresh()
+      onStreamFinished: {
+        root.handleActionOutput(text, "Failed to toggle profile")
+        root.refresh()
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim().length > 0) root.lastError = text.trim()
+      }
     }
   }
 
@@ -168,7 +254,25 @@ BarWidget {
     id: saveProc
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.refresh()
+      onStreamFinished: {
+        var ok = root.handleActionOutput(text, "Failed to save profile")
+        var nextId = root.pendingApplyId
+        root.pendingApplyId = ""
+        if (ok && nextId !== "") {
+          root.applyProfile(nextId)
+        } else {
+          root.refresh()
+        }
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim().length > 0) {
+          root.lastError = text.trim()
+          root.pendingApplyId = ""
+        }
+      }
     }
   }
 
@@ -176,7 +280,16 @@ BarWidget {
     id: delProc
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.refresh()
+      onStreamFinished: {
+        root.handleActionOutput(text, "Failed to delete profile")
+        root.refresh()
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim().length > 0) root.lastError = text.trim()
+      }
     }
   }
 
@@ -446,11 +559,11 @@ BarWidget {
               anchors.horizontalCenter: parent.horizontalCenter
             }
             Text {
-              text: root.memOffset > 0 ? ("+" + root.memOffset + " MHz") : "+0 MHz"
+              text: (root.memOffset >= 0 ? "+" : "") + root.memOffset + " MHz"
               font.pixelSize: 11
               font.bold: true
               renderType: Text.NativeRendering
-              color: root.memOffset > 0 ? Commons.Color.accent : Commons.Color.foreground
+              color: root.memOffset !== 0 ? Commons.Color.accent : Commons.Color.foreground
               anchors.horizontalCenter: parent.horizontalCenter
             }
           }
@@ -554,11 +667,11 @@ BarWidget {
                   }
 
                   Text {
-                    text: (modelData.mem_offset > 0 ? ("+" + modelData.mem_offset) : "+0") + " MHz VRAM"
+                    text: ((modelData.mem_offset || 0) >= 0 ? ("+" + (modelData.mem_offset || 0)) : String(modelData.mem_offset)) + " MHz VRAM"
                     font.pixelSize: 12
                     font.bold: true
                     renderType: Text.NativeRendering
-                    color: modelData.mem_offset > 0 ? Commons.Color.accent : Commons.Color.foreground
+                    color: (modelData.mem_offset || 0) !== 0 ? Commons.Color.accent : Commons.Color.foreground
                   }
 
                   Text {
@@ -614,6 +727,27 @@ BarWidget {
               }
             }
           }
+        }
+      }
+
+      // Error Banner (if any)
+      Rectangle {
+        visible: root.lastError !== ""
+        width: parent.width
+        height: errText.implicitHeight + Style.space(12)
+        color: Qt.rgba(Commons.Color.urgent.r, Commons.Color.urgent.g, Commons.Color.urgent.b, 0.16)
+        border.color: Commons.Color.urgent
+        border.width: 1
+        radius: Style.space(6)
+
+        Text {
+          id: errText
+          anchors.fill: parent
+          anchors.margins: Style.space(6)
+          text: root.lastError
+          font.pixelSize: 11
+          color: Commons.Color.urgent
+          wrapMode: Text.WordWrap
         }
       }
 
