@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import json
 import os
+import pwd
 import select
+import stat
 import sys
 import time
 from pathlib import Path
@@ -263,40 +266,181 @@ DEFAULT_PROFILES = {
 }
 
 
-def _chown_to_sudo_user(path: Path):
-    """Ensure files created under sudo in a user's home directory remain owned by that user."""
+def _get_sudo_identity() -> tuple[int, int, Path] | None:
+    """Return (uid, gid, home_dir) for the invoking non-root sudo user, or None."""
     if os.geteuid() != 0:
-        return
+        return None
     sudo_uid = os.environ.get("SUDO_UID")
     sudo_gid = os.environ.get("SUDO_GID")
-    if sudo_uid and sudo_gid:
+    if not sudo_uid or not sudo_gid:
+        return None
+    try:
+        uid = int(sudo_uid)
+        gid = int(sudo_gid)
+    except ValueError:
+        return None
+    if uid <= 0 or gid < 0:
+        return None
+    try:
+        pw = pwd.getpwuid(uid)
+    except KeyError:
+        return None
+    if not pw.pw_dir or pw.pw_dir == "/root":
+        return None
+    return uid, gid, Path(pw.pw_dir)
+
+
+def _open_dir_nofollow(parent_fd: int | None, name: str, uid: int, gid: int, create: bool) -> int:
+    """Open a directory without following symlinks, verifying or assigning user ownership."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if not create:
+            raise
         try:
-            os.chown(path, int(sudo_uid), int(sudo_gid))
-        except OSError:
+            os.mkdir(name, 0o755, dir_fd=parent_fd)
+        except FileExistsError:
             pass
+        fd = os.open(name, flags, dir_fd=parent_fd)
+        st = os.fstat(fd)
+        if st.st_uid != uid:
+            # Only chown if we just created/own-verified it; never follow symlinks or chown root-owned dirs.
+            if st.st_uid == 0 and st.st_nlink == 2:
+                os.fchown(fd, uid, gid)
+            else:
+                os.close(fd)
+                raise PermissionError(f"Refusing to use directory '{name}' not owned by uid {uid}")
+        return fd
+
+    st = os.fstat(fd)
+    if st.st_uid != uid:
+        os.close(fd)
+        raise PermissionError(f"Refusing to use directory '{name}' not owned by uid {uid}")
+    return fd
 
 
-def get_config_dir() -> Path:
-    sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user and sudo_user != "root":
-        p = Path(f"/home/{sudo_user}/.config/nvidia-tune")
+def _open_user_config_dir_fd(home_dir: Path, uid: int, gid: int, create: bool) -> int:
+    """Safely open <home_dir>/.config/nvidia-tune without following symlinks."""
+    home_fd = os.open(str(home_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if os.fstat(home_fd).st_uid != uid:
+            raise PermissionError(f"Home directory '{home_dir}' is not owned by uid {uid}")
+        cfg_parent_fd = _open_dir_nofollow(home_fd, ".config", uid, gid, create=create)
+    finally:
+        os.close(home_fd)
+
+    try:
+        return _open_dir_nofollow(cfg_parent_fd, "nvidia-tune", uid, gid, create=create)
+    finally:
+        os.close(cfg_parent_fd)
+
+
+def _safe_read_user_json(filename: str) -> dict | None:
+    """Read a JSON file from the user config directory without following symlinks when running as root."""
+    ident = _get_sudo_identity()
+    if ident is not None:
+        uid, gid, home_dir = ident
+        try:
+            dir_fd = _open_user_config_dir_fd(home_dir, uid, gid, create=False)
+        except OSError:
+            return None
+        try:
+            file_fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        except OSError:
+            return None
+        finally:
+            os.close(dir_fd)
+        try:
+            st = os.fstat(file_fd)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            with os.fdopen(file_fd, "r", encoding="utf-8") as stream:
+                data = json.load(stream)
+                return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    candidate = get_config_dir(create=False) / filename
+    if candidate.is_symlink() or not candidate.exists():
+        return None
+    try:
+        with candidate.open("r", encoding="utf-8") as stream:
+            data = json.load(stream)
+            return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _safe_write_user_json(filename: str, payload: dict):
+    """Write a JSON file to the user config directory without following symlinks or chowning arbitrary paths."""
+    ident = _get_sudo_identity()
+    if ident is not None:
+        uid, gid, home_dir = ident
+        dir_fd = _open_user_config_dir_fd(home_dir, uid, gid, create=True)
+        try:
+            file_fd = os.open(
+                filename,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                0o644,
+                dir_fd=dir_fd,
+            )
+        finally:
+            os.close(dir_fd)
+        try:
+            st = os.fstat(file_fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                os.close(file_fd)
+                raise PermissionError(f"Refusing to write non-regular or hardlinked file '{filename}'")
+            if st.st_uid != uid:
+                os.fchown(file_fd, uid, gid)
+            with os.fdopen(file_fd, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, indent=2)
+        except Exception:
+            try:
+                os.close(file_fd)
+            except OSError:
+                pass
+            raise
+        return
+
+    if os.geteuid() == 0:
+        return
+
+    cfg_dir = get_config_dir(create=True)
+    target = cfg_dir / filename
+    if target.is_symlink():
+        raise PermissionError(f"Refusing to write to symlink '{target}'")
+    with target.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2)
+
+
+def get_config_dir(create: bool = False) -> Path:
+    """Return the user or system configuration directory path."""
+    ident = _get_sudo_identity()
+    if ident is not None:
+        uid, gid, home_dir = ident
+        if create:
+            fd = _open_user_config_dir_fd(home_dir, uid, gid, create=True)
+            os.close(fd)
+        return home_dir / ".config" / "nvidia-tune"
+
+    home = os.environ.get("HOME", "")
+    if home and home != "/root":
+        p = Path(home) / ".config" / "nvidia-tune"
     else:
-        home = os.environ.get("HOME", "")
-        if home and home != "/root":
-            p = Path(home) / ".config" / "nvidia-tune"
-        else:
-            p = Path("/etc/nvidia-tune")
-    p.mkdir(parents=True, exist_ok=True)
-    _chown_to_sudo_user(p)
+        p = Path("/etc/nvidia-tune")
+    if create:
+        p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def get_profiles_file() -> Path:
-    return get_config_dir() / "profiles.json"
+    return get_config_dir(create=False) / "profiles.json"
 
 
 def get_state_file() -> Path:
-    return get_config_dir() / "active.json"
+    return get_config_dir(create=False) / "active.json"
 
 
 def get_system_profiles_file() -> Path:
@@ -309,23 +453,23 @@ def get_system_state_file() -> Path:
 
 def load_profiles() -> dict[str, dict]:
     profiles = {k: dict(v) for k, v in DEFAULT_PROFILES.items()}
-    for candidate in (get_system_profiles_file(), get_profiles_file()):
-        if candidate.exists():
-            try:
-                with candidate.open("r", encoding="utf-8") as stream:
-                    data = json.load(stream)
-                    if isinstance(data, dict):
-                        profiles.update(data)
-            except Exception:
-                pass
+    sys_f = get_system_profiles_file()
+    if sys_f.exists() and not sys_f.is_symlink():
+        try:
+            with sys_f.open("r", encoding="utf-8") as stream:
+                data = json.load(stream)
+                if isinstance(data, dict):
+                    profiles.update(data)
+        except Exception:
+            pass
+    user_data = _safe_read_user_json("profiles.json")
+    if user_data is not None:
+        profiles.update(user_data)
     return profiles
 
 
 def save_profiles(profiles: dict[str, dict]):
-    f = get_profiles_file()
-    with f.open("w", encoding="utf-8") as stream:
-        json.dump(profiles, stream, indent=2)
-    _chown_to_sudo_user(f)
+    _safe_write_user_json("profiles.json", profiles)
 
     # Mirror to /etc/nvidia-tune if writable (e.g. when running as root) so boot service sees custom profiles
     if os.geteuid() == 0:
@@ -351,34 +495,35 @@ def _sync_system_profiles(profiles: dict[str, dict]):
 
 
 def get_active_profile_id() -> str:
-    for sf in (get_state_file(), get_system_state_file()):
-        if sf.exists():
-            try:
-                with sf.open("r", encoding="utf-8") as stream:
-                    data = json.load(stream)
-                    if isinstance(data, dict) and "active_profile" in data:
-                        return data["active_profile"]
-            except Exception:
-                pass
+    user_state = _safe_read_user_json("active.json")
+    if user_state is not None and "active_profile" in user_state:
+        return user_state["active_profile"]
+    sys_f = get_system_state_file()
+    if sys_f.exists() and not sys_f.is_symlink():
+        try:
+            with sys_f.open("r", encoding="utf-8") as stream:
+                data = json.load(stream)
+                if isinstance(data, dict) and "active_profile" in data:
+                    return data["active_profile"]
+        except Exception:
+            pass
     return "stock"
 
 
 def set_active_profile_id(profile_id: str):
-    sf = get_state_file()
     try:
-        with sf.open("w", encoding="utf-8") as stream:
-            json.dump({"active_profile": profile_id}, stream, indent=2)
-        _chown_to_sudo_user(sf)
+        _safe_write_user_json("active.json", {"active_profile": profile_id})
     except Exception:
         pass
 
-    try:
-        sys_f = get_system_state_file()
-        sys_f.parent.mkdir(parents=True, exist_ok=True)
-        with sys_f.open("w", encoding="utf-8") as stream:
-            json.dump({"active_profile": profile_id}, stream, indent=2)
-    except Exception:
-        pass
+    if os.geteuid() == 0:
+        try:
+            sys_f = get_system_state_file()
+            sys_f.parent.mkdir(parents=True, exist_ok=True)
+            with sys_f.open("w", encoding="utf-8") as stream:
+                json.dump({"active_profile": profile_id}, stream, indent=2)
+        except Exception:
+            pass
 
 
 def apply_profile(profile_id: str) -> dict:
